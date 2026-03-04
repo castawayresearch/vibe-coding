@@ -1,0 +1,112 @@
+[
+  {
+    "name": "Google HTTPS GET",
+    "method": "GET",
+    "url": "https://www.google.com",
+    "headers": "Accept: text/html,application/xhtml+xml",
+    "body": "",
+    "content_type": "none",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "Google HTTP \u2192 HTTPS redirect",
+    "method": "GET",
+    "url": "http://www.google.com",
+    "headers": "Accept: text/html",
+    "body": "",
+    "content_type": "none",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "httpbin GET (JSON response)",
+    "method": "GET",
+    "url": "https://httpbin.org/get",
+    "headers": "Accept: application/json | X-Tool: SysMonitor",
+    "body": "",
+    "content_type": "none",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "httpbin POST JSON body",
+    "method": "POST",
+    "url": "https://httpbin.org/post",
+    "headers": "Accept: application/json",
+    "body": "{\"message\": \"hello\", \"tool\": \"SysMonitor\"}",
+    "content_type": "application/json",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "httpbin POST form-urlencoded",
+    "method": "POST",
+    "url": "https://httpbin.org/post",
+    "headers": "Accept: application/json",
+    "body": "field1=hello&field2=world",
+    "content_type": "application/x-www-form-urlencoded",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "httpbin Basic Auth",
+    "method": "GET",
+    "url": "https://httpbin.org/basic-auth/user/pass",
+    "headers": "",
+    "body": "",
+    "content_type": "none",
+    "follow_redirects": "yes",
+    "username": "user",
+    "password": "pass"
+  },
+  {
+    "name": "httpbin Response Headers",
+    "method": "GET",
+    "url": "https://httpbin.org/response-headers?X-Custom=hello&Server=SysMonitor",
+    "headers": "Accept: application/json",
+    "body": "",
+    "content_type": "none",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "httpbin 404 error",
+    "method": "GET",
+    "url": "https://httpbin.org/status/404",
+    "headers": "",
+    "body": "",
+    "content_type": "none",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "httpbin PUT JSON",
+    "method": "PUT",
+    "url": "https://httpbin.org/put",
+    "headers": "Accept: application/json",
+    "body": "{\"id\": 42, \"name\": \"updated\"}",
+    "content_type": "application/json",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  },
+  {
+    "name": "httpbin DELETE",
+    "method": "DELETE",
+    "url": "https://httpbin.org/delete",
+    "headers": "Accept: application/json",
+    "body": "",
+    "content_type": "none",
+    "follow_redirects": "yes",
+    "username": "",
+    "password": ""
+  }
+]
