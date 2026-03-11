@@ -91,10 +91,16 @@ def _resolve_config_file() -> Path:
 CONFIG_FILE: Path = _resolve_config_file()
 
 _DEFAULT_CONFIG: dict = {
-    "results_file": str(DATA_DIR / "check_results.txt"),
-    "history_file": str(DATA_DIR / "run_history.json"),
-    "script_file":  str(Path(__file__).parent / "checks.sh"),
-    "examples_file": str(DATA_DIR / "examples.json"),
+    "results_file":        str(DATA_DIR / "check_results.txt"),
+    "history_file":        str(DATA_DIR / "run_history.json"),
+    "script_file":         str(Path(__file__).parent / "checks.sh"),
+    "examples_file":       str(DATA_DIR / "examples.json"),
+    "s3_enabled":          False,
+    "s3_region":           "us-east-1",
+    "s3_bucket":           "",
+    "s3_key_prefix":       "sysmonitor",
+    "s3_access_key_id":    "",
+    "s3_secret_access_key": "",
 }
 
 
@@ -154,6 +160,36 @@ def save_history(history: list[dict]) -> None:
     hf = cfg_path("history_file")
     hf.parent.mkdir(parents=True, exist_ok=True)
     hf.write_text(json.dumps(history, indent=2))
+    try:
+        upload_history_to_s3(history)
+    except Exception:
+        pass  # S3 is optional; never block local save
+
+
+def upload_history_to_s3(history: list[dict]) -> None:
+    """Upload history JSON to S3 if S3 backup is enabled in config."""
+    if not APP_CONFIG.get("s3_enabled"):
+        return
+    bucket = APP_CONFIG.get("s3_bucket", "").strip()
+    if not bucket:
+        return
+    import boto3
+    prefix = APP_CONFIG.get("s3_key_prefix", "sysmonitor").strip().rstrip("/")
+    region = APP_CONFIG.get("s3_region", "us-east-1").strip()
+    key_id = APP_CONFIG.get("s3_access_key_id", "").strip()
+    secret = APP_CONFIG.get("s3_secret_access_key", "").strip()
+    kwargs: dict = {"region_name": region}
+    if key_id and secret:
+        kwargs["aws_access_key_id"] = key_id
+        kwargs["aws_secret_access_key"] = secret
+    s3 = boto3.client("s3", **kwargs)
+    s3_key = f"{prefix}/run_history.json"
+    s3.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=json.dumps(history, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
 
 
 def load_results() -> list[dict]:
@@ -1144,6 +1180,53 @@ class AdminPane(Container):
 
                 yield Static("", id="paths-status", classes="status-bar")
 
+            # ── S3 Backup ────────────────────────────────────────────────────
+            with Vertical(classes="section"):
+                yield Label("☁️  S3 Backup  (history pushed after every run)",
+                            classes="section-title")
+
+                with Horizontal(classes="row"):
+                    yield Label("Enable S3", classes="lbl")
+                    yield Select(
+                        [("No", "false"), ("Yes", "true")],
+                        value="true" if APP_CONFIG.get("s3_enabled") else "false",
+                        id="s3-enabled",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("AWS Region", classes="lbl")
+                    yield Input(value=APP_CONFIG.get("s3_region", "us-east-1"),
+                                placeholder="us-east-1", id="s3-region")
+
+                with Horizontal(classes="row"):
+                    yield Label("S3 Bucket", classes="lbl")
+                    yield Input(value=APP_CONFIG.get("s3_bucket", ""),
+                                placeholder="my-bucket-name", id="s3-bucket")
+
+                with Horizontal(classes="row"):
+                    yield Label("Key Prefix", classes="lbl")
+                    yield Input(value=APP_CONFIG.get("s3_key_prefix", "sysmonitor"),
+                                placeholder="sysmonitor", id="s3-prefix")
+
+                with Horizontal(classes="row"):
+                    yield Label("Access Key ID", classes="lbl")
+                    yield Input(value=APP_CONFIG.get("s3_access_key_id", ""),
+                                placeholder="(leave blank for IAM role / env vars)",
+                                id="s3-key-id")
+
+                with Horizontal(classes="row"):
+                    yield Label("Secret Key", classes="lbl")
+                    yield Input(value=APP_CONFIG.get("s3_secret_access_key", ""),
+                                placeholder="(leave blank for IAM role / env vars)",
+                                id="s3-secret", password=True)
+
+                with Horizontal(classes="btn-row"):
+                    yield Button("🔗  Test Connection", id="test-s3-btn")
+                    yield Button("💾  Save S3 Config", id="save-s3-btn",
+                                 variant="primary")
+
+                yield Static("", id="s3-status", classes="status-bar")
+
             # ── HTTP Examples ───────────────────────────────────────────────
             with Vertical(classes="section"):
                 yield Label("🔗  HTTP Examples  (used in Tab 4 dropdown)",
@@ -1279,6 +1362,55 @@ class AdminPane(Container):
             self._set_status("#paths-status", "↩️  Reset to defaults and saved.")
         except Exception as exc:
             self._set_status("#paths-status", f"Error: {exc}", error=True)
+
+    # -----------------------------------------------------------------------
+    # S3 backup handlers
+    # -----------------------------------------------------------------------
+
+    @on(Button.Pressed, "#save-s3-btn")
+    def save_s3_config(self) -> None:
+        APP_CONFIG["s3_enabled"]          = self._str("#s3-enabled", Select) == "true"
+        APP_CONFIG["s3_region"]           = self._str("#s3-region")
+        APP_CONFIG["s3_bucket"]           = self._str("#s3-bucket")
+        APP_CONFIG["s3_key_prefix"]       = self._str("#s3-prefix")
+        APP_CONFIG["s3_access_key_id"]    = self._str("#s3-key-id")
+        APP_CONFIG["s3_secret_access_key"] = self._str("#s3-secret")
+        try:
+            save_config(APP_CONFIG)
+            status = "✅  S3 config saved"
+            if APP_CONFIG["s3_enabled"]:
+                status += f"  (uploads to s3://{APP_CONFIG['s3_bucket']}/{APP_CONFIG['s3_key_prefix']}/run_history.json)"
+            self._set_status("#s3-status", status)
+        except Exception as exc:
+            self._set_status("#s3-status", f"Error: {exc}", error=True)
+
+    @on(Button.Pressed, "#test-s3-btn")
+    async def test_s3_connection(self) -> None:
+        import asyncio
+        self._set_status("#s3-status", "⏳  Testing connection…")
+        bucket = self._str("#s3-bucket")
+        region = self._str("#s3-region") or "us-east-1"
+        key_id = self._str("#s3-key-id")
+        secret = self._str("#s3-secret")
+        if not bucket:
+            self._set_status("#s3-status", "S3 Bucket name is required.", error=True)
+            return
+
+        def _test() -> str:
+            import boto3
+            kwargs: dict = {"region_name": region}
+            if key_id and secret:
+                kwargs["aws_access_key_id"] = key_id
+                kwargs["aws_secret_access_key"] = secret
+            client = boto3.client("s3", **kwargs)
+            client.head_bucket(Bucket=bucket)
+            return f"✅  Connected to s3://{bucket} in {region}"
+
+        try:
+            msg = await asyncio.to_thread(_test)
+            self._set_status("#s3-status", msg)
+        except Exception as exc:
+            self._set_status("#s3-status", f"Connection failed: {exc}", error=True)
 
     # -----------------------------------------------------------------------
     # Examples table handlers
