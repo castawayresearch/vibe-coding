@@ -1396,6 +1396,9 @@ class AdminPane(Container):
             self._set_status("#s3-status", "S3 Bucket name is required.", error=True)
             return
 
+        auth_method = "explicit keys" if (key_id and secret) else "IAM / env vars"
+        conn_str = f"s3://{bucket}  (region: {region}, auth: {auth_method})"
+
         def _test() -> str:
             import boto3
             kwargs: dict = {"region_name": region}
@@ -1404,13 +1407,18 @@ class AdminPane(Container):
                 kwargs["aws_secret_access_key"] = secret
             client = boto3.client("s3", **kwargs)
             client.head_bucket(Bucket=bucket)
-            return f"✅  Connected to s3://{bucket} in {region}"
+            return f"✅  Connected — {conn_str}"
 
         try:
             msg = await asyncio.to_thread(_test)
             self._set_status("#s3-status", msg)
         except Exception as exc:
-            self._set_status("#s3-status", f"Connection failed: {exc}", error=True)
+            full_error = (
+                f"Connection failed\n"
+                f"  Endpoint : {conn_str}\n"
+                f"  Error    : {exc}"
+            )
+            self._set_status("#s3-status", full_error, error=True)
 
     # -----------------------------------------------------------------------
     # Examples table handlers
