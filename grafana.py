@@ -32,6 +32,7 @@ CONFIG = {
     "range_from":    "now-1h",       # Grafana time range shorthand
     "range_to":      "now",
     "max_points":    100,
+    "verify_ssl":    True,           # set False for self-signed / internal CA certs
 }
 
 # Thresholds — each entry: (label, operator, value)
@@ -209,6 +210,11 @@ def main() -> None:
 
     session = requests.Session()
     session.headers.update(_headers())
+    session.verify = CONFIG["verify_ssl"]
+    if not CONFIG["verify_ssl"]:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        print("⚠️  SSL verification disabled.")
 
     # Health check
     health = session.get(f"{base_url}/api/health")

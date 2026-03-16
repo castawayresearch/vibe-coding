@@ -162,6 +162,7 @@ _DEFAULT_CONFIG: dict = {
     "grafana_range_from":         "now-1h",
     "grafana_range_to":           "now",
     "grafana_thresholds":         "[]",
+    "grafana_verify_ssl":         True,
 }
 
 
@@ -529,6 +530,11 @@ def _grafana_query() -> list[dict]:
     except (ValueError, TypeError):
         ds_id_int = 1
 
+    verify_ssl = APP_CONFIG.get("grafana_verify_ssl", True)
+    if not verify_ssl:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type":  "application/json",
@@ -551,6 +557,7 @@ def _grafana_query() -> list[dict]:
         json=payload,
         headers=headers,
         timeout=15,
+        verify=verify_ssl,
     )
     resp.raise_for_status()
     raw = resp.json()
@@ -1554,6 +1561,15 @@ class AdminPane(Container):
                     )
 
                 with Horizontal(classes="row"):
+                    yield Label("Verify SSL", classes="lbl")
+                    yield Select(
+                        [("Yes — verify certificate (default)", "true"),
+                         ("No  — skip SSL verification", "false")],
+                        value="false" if not APP_CONFIG.get("grafana_verify_ssl", True) else "true",
+                        id="grafana-admin-verify-ssl",
+                    )
+
+                with Horizontal(classes="row"):
                     yield Label("Dashboard UID", classes="lbl")
                     yield Input(
                         value=APP_CONFIG.get("grafana_dashboard_uid", ""),
@@ -1999,6 +2015,7 @@ class AdminPane(Container):
         APP_CONFIG["grafana_range_from"]    = self._str("#grafana-admin-range-from") or "now-1h"
         APP_CONFIG["grafana_range_to"]      = self._str("#grafana-admin-range-to") or "now"
         APP_CONFIG["grafana_thresholds"]    = self._str("#grafana-admin-thresholds") or "[]"
+        APP_CONFIG["grafana_verify_ssl"]    = self._str("#grafana-admin-verify-ssl", Select) != "false"
         try:
             save_config(APP_CONFIG)
             self._set_status("#grafana-admin-status", "✅  Grafana config saved.")
@@ -2008,20 +2025,25 @@ class AdminPane(Container):
     @on(Button.Pressed, "#test-grafana-btn")
     async def test_grafana_connection(self) -> None:
         self._set_status("#grafana-admin-status", "⏳  Testing Grafana connection…")
-        base_url = (self._str("#grafana-admin-url") or "").rstrip("/")
-        token    = self._str("#grafana-admin-token")
+        base_url   = (self._str("#grafana-admin-url") or "").rstrip("/")
+        token      = self._str("#grafana-admin-token")
+        verify_ssl = self._str("#grafana-admin-verify-ssl", Select) != "false"
         if not base_url or not token:
             self._set_status("#grafana-admin-status",
                              "URL and Token are required.", error=True)
             return
 
         def _test() -> str:
+            if not verify_ssl:
+                import urllib3
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             headers = {"Authorization": f"Bearer {token}"}
             resp = requests.get(f"{base_url}/api/health", headers=headers,
-                                timeout=10)
+                                timeout=10, verify=verify_ssl)
             resp.raise_for_status()
-            db = resp.json().get("database", "ok")
-            return f"✅  Connected to {base_url}  (database: {db})"
+            db  = resp.json().get("database", "ok")
+            ssl = "SSL off" if not verify_ssl else "SSL on"
+            return f"✅  Connected to {base_url}  (database: {db}, {ssl})"
 
         try:
             msg = await asyncio.to_thread(_test)
