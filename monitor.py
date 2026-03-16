@@ -7,6 +7,8 @@ Requires: pip install textual requests
 import argparse
 import asyncio
 import json
+import logging
+import logging.handlers
 import os
 import shlex
 import sys
@@ -90,11 +92,47 @@ def _resolve_config_file() -> Path:
 
 CONFIG_FILE: Path = _resolve_config_file()
 
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def _setup_logging(log_path: Path) -> None:
+    """Attach a rotating file handler to the 'sysmonitor' logger.
+    Safe to call multiple times — replaces any existing file handler so the
+    log path can be changed at runtime from the Admin pane."""
+    log_path = log_path.expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _logger = logging.getLogger("sysmonitor")
+    _logger.setLevel(logging.DEBUG)
+    # Drop any previously attached RotatingFileHandlers before re-adding.
+    _logger.handlers = [
+        h for h in _logger.handlers
+        if not isinstance(h, logging.handlers.RotatingFileHandler)
+    ]
+    handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        maxBytes=5 * 1024 * 1024,  # 5 MB per file
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _logger.addHandler(handler)
+
+
+# Module-level logger — used throughout the file.
+logger = logging.getLogger("sysmonitor")
+
+
 _DEFAULT_CONFIG: dict = {
     "results_file":        str(DATA_DIR / "check_results.txt"),
     "history_file":        str(DATA_DIR / "run_history.json"),
     "script_file":         str(Path(__file__).parent / "checks.sh"),
     "examples_file":       str(DATA_DIR / "examples.json"),
+    "log_file":            str(DATA_DIR / "app.log"),
     "s3_enabled":          False,
     "s3_region":           "us-east-1",
     "s3_bucket":           "",
@@ -108,8 +146,8 @@ def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             return {**_DEFAULT_CONFIG, **json.loads(CONFIG_FILE.read_text())}
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to load config %s — using defaults: %s", CONFIG_FILE, exc)
     return dict(_DEFAULT_CONFIG)
 
 
@@ -119,6 +157,9 @@ def save_config(cfg: dict) -> None:
 
 # Mutable global — Admin pane updates this at runtime.
 APP_CONFIG: dict = load_config()
+
+# Start logging as soon as we have the config.
+_setup_logging(Path(APP_CONFIG.get("log_file", str(DATA_DIR / "app.log"))))
 
 
 def cfg_path(key: str) -> Path:
@@ -152,7 +193,8 @@ def load_history() -> list[dict]:
         return []
     try:
         return json.loads(hf.read_text())
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to load history file %s: %s", hf, exc)
         return []
 
 
@@ -162,8 +204,8 @@ def save_history(history: list[dict]) -> None:
     hf.write_text(json.dumps(history, indent=2))
     try:
         upload_history_to_s3(history)
-    except Exception:
-        pass  # S3 is optional; never block local save
+    except Exception as exc:
+        logger.warning("S3 upload failed: %s", exc)
 
 
 def upload_history_to_s3(history: list[dict]) -> None:
@@ -204,8 +246,8 @@ def load_results() -> list[dict]:
             if ": " in line:
                 name, _, status = line.partition(": ")
                 results.append({"name": name.strip(), "status": status.strip()})
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("Failed to read results file %s: %s", rf, exc)
     return results
 
 
@@ -365,8 +407,8 @@ def load_examples_from_file() -> dict[str, dict]:
                 }
                 if loaded:
                     return loaded
-        except (json.JSONDecodeError, OSError, KeyError):
-            pass
+        except (json.JSONDecodeError, OSError, KeyError) as exc:
+            logger.warning("Failed to load examples file %s — using built-ins: %s", ex_file, exc)
     return dict(_BUILTIN_EXAMPLES)
 
 
@@ -1173,6 +1215,12 @@ class AdminPane(Container):
                     yield Input(value=APP_CONFIG["examples_file"],
                                 id="cfg-examples-file")
 
+                with Horizontal(classes="row"):
+                    yield Label("Log file", classes="lbl")
+                    yield Input(value=APP_CONFIG.get("log_file",
+                                                     str(DATA_DIR / "app.log")),
+                                id="cfg-log-file")
+
                 with Horizontal(classes="btn-row"):
                     yield Button("💾  Save Paths", id="save-paths-btn",
                                  variant="primary")
@@ -1342,8 +1390,10 @@ class AdminPane(Container):
         APP_CONFIG["history_file"] = self._str("#cfg-history-file")
         APP_CONFIG["script_file"]  = self._str("#cfg-script-file")
         APP_CONFIG["examples_file"] = self._str("#cfg-examples-file")
+        APP_CONFIG["log_file"]     = self._str("#cfg-log-file")
         try:
             save_config(APP_CONFIG)
+            _setup_logging(cfg_path("log_file"))
             self._set_status("#paths-status",
                              f"✅  Saved to {CONFIG_FILE}")
         except Exception as exc:
@@ -1357,8 +1407,10 @@ class AdminPane(Container):
         self._set("#cfg-history-file", APP_CONFIG["history_file"])
         self._set("#cfg-script-file",  APP_CONFIG["script_file"])
         self._set("#cfg-examples-file", APP_CONFIG["examples_file"])
+        self._set("#cfg-log-file",     APP_CONFIG["log_file"])
         try:
             save_config(APP_CONFIG)
+            _setup_logging(cfg_path("log_file"))
             self._set_status("#paths-status", "↩️  Reset to defaults and saved.")
         except Exception as exc:
             self._set_status("#paths-status", f"Error: {exc}", error=True)
@@ -1557,19 +1609,19 @@ class SysMonitorApp(App):
     def refresh_all_panes(self) -> None:
         try:
             self.query_one("#status-pane", StatusPane).refresh_data()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Status pane refresh error: %s", exc)
         try:
             self.query_one("#history-pane", HistoryPane).load_history()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("History pane refresh error: %s", exc)
 
     def reload_http_examples(self) -> None:
         """Tell the HTTP Tester to rebuild its examples dropdown."""
         try:
             self.query_one("#http-pane", HttpTesterPane).reload_examples()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("HTTP examples reload error: %s", exc)
 
     def action_switch_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
