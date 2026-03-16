@@ -14,6 +14,7 @@ import shlex
 import sys
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -139,6 +140,28 @@ _DEFAULT_CONFIG: dict = {
     "s3_key_prefix":       "sysmonitor",
     "s3_access_key_id":    "",
     "s3_secret_access_key": "",
+    # Schedule
+    "schedule_enabled":           False,
+    "schedule_type":              "1h",
+    "schedule_daily_time":        "09:00",
+    # Mattermost
+    "mattermost_enabled":         False,
+    "mattermost_webhook_url":     "",
+    "mattermost_channel":         "",
+    "mattermost_alert_threshold": "100",
+    "mattermost_mention":         "@here",
+    # Grafana
+    "grafana_enabled":            False,
+    "grafana_url":                "http://localhost:3000",
+    "grafana_token":              "",
+    "grafana_dashboard_uid":      "",
+    "grafana_panel_title":        "",
+    "grafana_panel_id":           "",
+    "grafana_datasource_id":      "1",
+    "grafana_promql":             "",
+    "grafana_range_from":         "now-1h",
+    "grafana_range_to":           "now",
+    "grafana_thresholds":         "[]",
 }
 
 
@@ -425,6 +448,127 @@ ACTIVE_EXAMPLES: dict[str, dict] = load_examples_from_file()
 
 
 # ---------------------------------------------------------------------------
+# Mattermost alert helper
+# ---------------------------------------------------------------------------
+
+def send_mattermost_alert(passed: int, total: int, run_ts: str) -> None:
+    """POST a check-run summary to a Mattermost webhook if alerts are enabled."""
+    if not APP_CONFIG.get("mattermost_enabled"):
+        return
+    webhook_url = APP_CONFIG.get("mattermost_webhook_url", "").strip()
+    if not webhook_url:
+        return
+    threshold_pct = float(APP_CONFIG.get("mattermost_alert_threshold", "100") or "100")
+    pass_pct = (passed / total * 100) if total else 0.0
+    if pass_pct >= threshold_pct:
+        return  # within threshold, no alert needed
+    mention = APP_CONFIG.get("mattermost_mention", "").strip()
+    channel = APP_CONFIG.get("mattermost_channel", "").strip()
+    prefix = f"{mention} " if mention else ""
+    icon = "🔴" if pass_pct == 0 else ("⚠️" if pass_pct < 100 else "✅")
+    text = (
+        f"{prefix}{icon} **SysMonitor Alert** — {passed}/{total} checks passed "
+        f"({pass_pct:.0f}%) at {run_ts}"
+    )
+    payload: dict = {"text": text}
+    if channel:
+        payload["channel"] = channel
+    requests.post(webhook_url, json=payload, timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Grafana query helpers
+# ---------------------------------------------------------------------------
+
+def _grafana_time_ms(shorthand: str) -> str:
+    """Convert 'now-1h' / 'now' shorthand to epoch milliseconds string."""
+    now_ts = datetime.now().timestamp()
+    if shorthand == "now":
+        return str(int(now_ts * 1000))
+    if shorthand.startswith("now-"):
+        suffix = shorthand[4:]
+        units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+        unit = suffix[-1]
+        try:
+            amount = int(suffix[:-1])
+            delta = amount * units.get(unit, 60)
+            return str(int((now_ts - delta) * 1000))
+        except ValueError:
+            pass
+    return shorthand  # already a raw ms value or unrecognised
+
+
+def _grafana_check(value: float, op: str, threshold: float) -> bool:
+    """Evaluate a single threshold comparison."""
+    return {
+        ">":  value >  threshold,
+        ">=": value >= threshold,
+        "<":  value <  threshold,
+        "<=": value <= threshold,
+        "==": value == threshold,
+    }.get(op, False)
+
+
+def _grafana_query() -> list[dict]:
+    """Blocking function: call Grafana API, return list of series dicts.
+    Each dict: {"name": str, "values": [float|None, ...]}
+    Raises ValueError if config is incomplete; raises HTTPError on bad response."""
+    base_url = APP_CONFIG.get("grafana_url", "").rstrip("/")
+    token    = APP_CONFIG.get("grafana_token", "")
+    ds_id    = APP_CONFIG.get("grafana_datasource_id", "1")
+    promql   = APP_CONFIG.get("grafana_promql", "")
+    range_from = APP_CONFIG.get("grafana_range_from", "now-1h")
+    range_to   = APP_CONFIG.get("grafana_range_to",   "now")
+
+    if not base_url or not token or not promql:
+        raise ValueError(
+            "Grafana not fully configured — url, token and promql are all required."
+        )
+    try:
+        ds_id_int = int(ds_id)
+    except (ValueError, TypeError):
+        ds_id_int = 1
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
+    payload = {
+        "queries": [
+            {
+                "datasourceId": ds_id_int,
+                "expr":          promql,
+                "refId":         "A",
+                "maxDataPoints": 100,
+                "intervalMs":    60_000,
+            }
+        ],
+        "from": _grafana_time_ms(range_from),
+        "to":   _grafana_time_ms(range_to),
+    }
+    resp = requests.post(
+        f"{base_url}/api/ds/query",
+        json=payload,
+        headers=headers,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+
+    series: list[dict] = []
+    for frame in raw.get("results", {}).get("A", {}).get("frames", []):
+        fields      = frame["schema"]["fields"]
+        values_data = frame["data"]["values"]
+        for i, field in enumerate(fields[1:], start=1):
+            name = field.get("labels", {}) or field.get("name", f"series_{i}")
+            series.append({
+                "name":   str(name),
+                "values": values_data[i] if i < len(values_data) else [],
+            })
+    return series
+
+
+# ---------------------------------------------------------------------------
 # Overview / Status pane
 # ---------------------------------------------------------------------------
 
@@ -565,6 +709,17 @@ class ScriptPane(Container):
         btn.label = "⏳ Running…"
         self._run_script()
 
+    def run_now(self) -> None:
+        """Trigger a script run programmatically (used by the scheduler).
+        Silently skips if a run is already in progress."""
+        btn = self.query_one("#run-btn", Button)
+        if btn.disabled:
+            logger.debug("Auto-run skipped: run already in progress.")
+            return
+        btn.disabled = True
+        btn.label = "⏳ Running…"
+        self._run_script()
+
     @work(exclusive=True)
     async def _run_script(self) -> None:
         log = self.query_one("#script-log", RichLog)
@@ -632,6 +787,12 @@ class ScriptPane(Container):
             "duration": round(duration, 1),
         })
         save_history(history[:100])
+
+        # Mattermost alert (fires if pass rate breaches configured threshold)
+        try:
+            send_mattermost_alert(passed, total, start.isoformat())
+        except Exception as exc:
+            logger.warning("Mattermost alert failed: %s", exc)
 
         self.app.refresh_all_panes()
         btn.disabled = False
@@ -1275,6 +1436,193 @@ class AdminPane(Container):
 
                 yield Static("", id="s3-status", classes="status-bar")
 
+            # ── Auto-Run Schedule ────────────────────────────────────────────
+            with Vertical(classes="section"):
+                yield Label("🕐  Auto-Run Schedule", classes="section-title")
+
+                with Horizontal(classes="row"):
+                    yield Label("Enable", classes="lbl")
+                    yield Select(
+                        [("No", "false"), ("Yes", "true")],
+                        value="true" if APP_CONFIG.get("schedule_enabled") else "false",
+                        id="sched-enabled",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Run every", classes="lbl")
+                    yield Select(
+                        [("15 minutes", "15m"), ("30 minutes", "30m"),
+                         ("1 hour",     "1h"),  ("2 hours",   "2h"),
+                         ("6 hours",    "6h"),  ("12 hours",  "12h"),
+                         ("Daily at time →", "daily")],
+                        value=APP_CONFIG.get("schedule_type", "1h"),
+                        id="sched-type",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Daily time (HH:MM)", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("schedule_daily_time", "09:00"),
+                        placeholder="09:00",
+                        id="sched-daily-time",
+                    )
+
+                with Horizontal(classes="btn-row"):
+                    yield Button("💾  Save Schedule", id="save-sched-btn",
+                                 variant="primary")
+
+                yield Static("", id="sched-status", classes="status-bar")
+
+            # ── Mattermost Alerts ────────────────────────────────────────────
+            with Vertical(classes="section"):
+                yield Label("📣  Mattermost Alerts", classes="section-title")
+
+                with Horizontal(classes="row"):
+                    yield Label("Enable", classes="lbl")
+                    yield Select(
+                        [("No", "false"), ("Yes", "true")],
+                        value="true" if APP_CONFIG.get("mattermost_enabled") else "false",
+                        id="mm-enabled",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Webhook URL", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("mattermost_webhook_url", ""),
+                        placeholder="https://mattermost.example.com/hooks/xxx",
+                        id="mm-webhook-url",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Channel", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("mattermost_channel", ""),
+                        placeholder="#alerts  (optional, uses webhook default)",
+                        id="mm-channel",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Alert threshold %", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("mattermost_alert_threshold", "100"),
+                        placeholder="100 = alert on any failure, 80 = alert if <80%",
+                        id="mm-threshold",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Mention", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("mattermost_mention", "@here"),
+                        placeholder="@here  or  @channel  (optional)",
+                        id="mm-mention",
+                    )
+
+                with Horizontal(classes="btn-row"):
+                    yield Button("🔔  Test Alert", id="test-mm-btn")
+                    yield Button("💾  Save Mattermost Config", id="save-mm-btn",
+                                 variant="primary")
+
+                yield Static("", id="mm-status", classes="status-bar")
+
+            # ── Grafana ──────────────────────────────────────────────────────
+            with Vertical(classes="section"):
+                yield Label("📈  Grafana", classes="section-title")
+
+                with Horizontal(classes="row"):
+                    yield Label("Enable", classes="lbl")
+                    yield Select(
+                        [("No", "false"), ("Yes", "true")],
+                        value="true" if APP_CONFIG.get("grafana_enabled") else "false",
+                        id="grafana-admin-enabled",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Grafana URL", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_url", "http://localhost:3000"),
+                        placeholder="http://localhost:3000",
+                        id="grafana-admin-url",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("API Token", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_token", ""),
+                        placeholder="glsa_xxxx",
+                        id="grafana-admin-token",
+                        password=True,
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Dashboard UID", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_dashboard_uid", ""),
+                        placeholder="abc123  (from dashboard URL)",
+                        id="grafana-admin-uid",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Panel title", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_panel_title", ""),
+                        placeholder="CPU Usage",
+                        id="grafana-admin-panel-title",
+                        classes="input-mid",
+                    )
+                    yield Label("Panel ID", classes="lbl-sm")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_panel_id", ""),
+                        placeholder="(optional, overrides title)",
+                        id="grafana-admin-panel-id",
+                        classes="input-mid",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Datasource ID", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_datasource_id", "1"),
+                        placeholder="1",
+                        id="grafana-admin-ds-id",
+                        classes="input-mid",
+                    )
+                    yield Label("Range from", classes="lbl-sm")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_range_from", "now-1h"),
+                        placeholder="now-1h",
+                        id="grafana-admin-range-from",
+                        classes="input-mid",
+                    )
+                    yield Label("to", classes="lbl-sm")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_range_to", "now"),
+                        placeholder="now",
+                        id="grafana-admin-range-to",
+                        classes="input-mid",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("PromQL", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_promql", ""),
+                        placeholder='rate(node_cpu_seconds_total{mode="user"}[5m])*100',
+                        id="grafana-admin-promql",
+                    )
+
+                with Horizontal(classes="row"):
+                    yield Label("Thresholds JSON", classes="lbl")
+                    yield Input(
+                        value=APP_CONFIG.get("grafana_thresholds", "[]"),
+                        placeholder='[["CPU high", ">", 80.0], ["CPU low", "<", 5.0]]',
+                        id="grafana-admin-thresholds",
+                    )
+
+                with Horizontal(classes="btn-row"):
+                    yield Button("🔗  Test Connection", id="test-grafana-btn")
+                    yield Button("💾  Save Grafana Config", id="save-grafana-btn",
+                                 variant="primary")
+
+                yield Static("", id="grafana-admin-status", classes="status-bar")
+
             # ── HTTP Examples ───────────────────────────────────────────────
             with Vertical(classes="section"):
                 yield Label("🔗  HTTP Examples  (used in Tab 4 dropdown)",
@@ -1566,6 +1914,340 @@ class AdminPane(Container):
                          f"↩️  Reset to {len(ACTIVE_EXAMPLES)} built-in examples (unsaved).")
         self.app.reload_http_examples()
 
+    # -----------------------------------------------------------------------
+    # Schedule handlers
+    # -----------------------------------------------------------------------
+
+    @on(Button.Pressed, "#save-sched-btn")
+    def save_schedule_config(self) -> None:
+        APP_CONFIG["schedule_enabled"]    = self._str("#sched-enabled", Select) == "true"
+        APP_CONFIG["schedule_type"]       = self._str("#sched-type", Select) or "1h"
+        APP_CONFIG["schedule_daily_time"] = self._str("#sched-daily-time") or "09:00"
+        try:
+            save_config(APP_CONFIG)
+            enabled = APP_CONFIG["schedule_enabled"]
+            stype   = APP_CONFIG["schedule_type"]
+            if enabled:
+                if stype == "daily":
+                    detail = f"daily at {APP_CONFIG['schedule_daily_time']}"
+                else:
+                    detail = f"every {stype}"
+                self._set_status("#sched-status",
+                                 f"✅  Auto-run enabled — {detail}.")
+            else:
+                self._set_status("#sched-status", "✅  Auto-run disabled.")
+        except Exception as exc:
+            self._set_status("#sched-status", f"Error: {exc}", error=True)
+
+    # -----------------------------------------------------------------------
+    # Mattermost handlers
+    # -----------------------------------------------------------------------
+
+    @on(Button.Pressed, "#save-mm-btn")
+    def save_mattermost_config(self) -> None:
+        APP_CONFIG["mattermost_enabled"]          = self._str("#mm-enabled", Select) == "true"
+        APP_CONFIG["mattermost_webhook_url"]      = self._str("#mm-webhook-url")
+        APP_CONFIG["mattermost_channel"]          = self._str("#mm-channel")
+        APP_CONFIG["mattermost_alert_threshold"]  = self._str("#mm-threshold") or "100"
+        APP_CONFIG["mattermost_mention"]          = self._str("#mm-mention")
+        try:
+            save_config(APP_CONFIG)
+            self._set_status("#mm-status", "✅  Mattermost config saved.")
+        except Exception as exc:
+            self._set_status("#mm-status", f"Error: {exc}", error=True)
+
+    @on(Button.Pressed, "#test-mm-btn")
+    async def test_mattermost(self) -> None:
+        self._set_status("#mm-status", "⏳  Sending test alert…")
+        webhook_url = self._str("#mm-webhook-url")
+        channel     = self._str("#mm-channel")
+        mention     = self._str("#mm-mention")
+        if not webhook_url:
+            self._set_status("#mm-status", "Webhook URL is required.", error=True)
+            return
+
+        def _send() -> None:
+            prefix = f"{mention} " if mention else ""
+            payload: dict = {
+                "text": f"{prefix}✅ SysMonitor test alert — connection OK!"
+            }
+            if channel:
+                payload["channel"] = channel
+            resp = requests.post(webhook_url, json=payload, timeout=10)
+            resp.raise_for_status()
+
+        try:
+            await asyncio.to_thread(_send)
+            self._set_status("#mm-status", "✅  Test alert sent successfully.")
+        except Exception as exc:
+            self._set_status("#mm-status", f"Test failed: {exc}", error=True)
+
+    # -----------------------------------------------------------------------
+    # Grafana admin handlers
+    # -----------------------------------------------------------------------
+
+    @on(Button.Pressed, "#save-grafana-btn")
+    def save_grafana_config(self) -> None:
+        APP_CONFIG["grafana_enabled"]       = self._str("#grafana-admin-enabled", Select) == "true"
+        APP_CONFIG["grafana_url"]           = self._str("#grafana-admin-url")
+        APP_CONFIG["grafana_token"]         = self._str("#grafana-admin-token")
+        APP_CONFIG["grafana_dashboard_uid"] = self._str("#grafana-admin-uid")
+        APP_CONFIG["grafana_panel_title"]   = self._str("#grafana-admin-panel-title")
+        APP_CONFIG["grafana_panel_id"]      = self._str("#grafana-admin-panel-id")
+        APP_CONFIG["grafana_datasource_id"] = self._str("#grafana-admin-ds-id") or "1"
+        APP_CONFIG["grafana_promql"]        = self._str("#grafana-admin-promql")
+        APP_CONFIG["grafana_range_from"]    = self._str("#grafana-admin-range-from") or "now-1h"
+        APP_CONFIG["grafana_range_to"]      = self._str("#grafana-admin-range-to") or "now"
+        APP_CONFIG["grafana_thresholds"]    = self._str("#grafana-admin-thresholds") or "[]"
+        try:
+            save_config(APP_CONFIG)
+            self._set_status("#grafana-admin-status", "✅  Grafana config saved.")
+        except Exception as exc:
+            self._set_status("#grafana-admin-status", f"Error: {exc}", error=True)
+
+    @on(Button.Pressed, "#test-grafana-btn")
+    async def test_grafana_connection(self) -> None:
+        self._set_status("#grafana-admin-status", "⏳  Testing Grafana connection…")
+        base_url = (self._str("#grafana-admin-url") or "").rstrip("/")
+        token    = self._str("#grafana-admin-token")
+        if not base_url or not token:
+            self._set_status("#grafana-admin-status",
+                             "URL and Token are required.", error=True)
+            return
+
+        def _test() -> str:
+            headers = {"Authorization": f"Bearer {token}"}
+            resp = requests.get(f"{base_url}/api/health", headers=headers,
+                                timeout=10)
+            resp.raise_for_status()
+            db = resp.json().get("database", "ok")
+            return f"✅  Connected to {base_url}  (database: {db})"
+
+        try:
+            msg = await asyncio.to_thread(_test)
+            self._set_status("#grafana-admin-status", msg)
+        except Exception as exc:
+            self._set_status("#grafana-admin-status",
+                             f"Connection failed: {exc}", error=True)
+
+
+# ---------------------------------------------------------------------------
+# Log Viewer pane  (Tab 6)
+# ---------------------------------------------------------------------------
+
+class LogViewerPane(Container):
+    DEFAULT_CSS = """
+    LogViewerPane { height: 100%; }
+    LogViewerPane .controls {
+        height: auto;
+        border: round $primary;
+        padding: 1 2;
+        margin-bottom: 1;
+    }
+    LogViewerPane .controls Horizontal { height: auto; }
+    LogViewerPane RichLog {
+        height: 1fr;
+        border: round $primary;
+    }
+    LogViewerPane .section-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    LogViewerPane .subtitle {
+        color: $text-muted;
+        text-style: italic;
+        margin-bottom: 1;
+    }
+    LogViewerPane Button { margin-right: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        log_path = APP_CONFIG.get("log_file", str(DATA_DIR / "app.log"))
+        with Vertical(classes="controls"):
+            yield Label("📄  Log Viewer", classes="section-title")
+            yield Label(f"File: {log_path}", id="log-path-label",
+                        classes="subtitle")
+            with Horizontal():
+                yield Button("🔄  Refresh", id="log-refresh-btn",
+                             variant="primary")
+                yield Button("🗑  Clear View", id="log-clear-btn")
+        yield RichLog(id="log-viewer", highlight=False, markup=True, wrap=True)
+
+    def on_mount(self) -> None:
+        self._load_log()
+        self.set_interval(5, self._load_log)
+
+    def _load_log(self) -> None:
+        log_path = Path(APP_CONFIG.get("log_file",
+                                       str(DATA_DIR / "app.log"))).expanduser()
+        try:
+            self.query_one("#log-path-label", Label).update(
+                f"File: {log_path}"
+            )
+        except Exception:
+            pass
+
+        widget = self.query_one("#log-viewer", RichLog)
+        widget.clear()
+
+        if not log_path.exists():
+            widget.write(
+                f"[dim]Log file not found: {log_path}\n"
+                f"Errors will appear here automatically once the app "
+                f"encounters one.[/dim]"
+            )
+            return
+
+        try:
+            lines = log_path.read_text(encoding="utf-8",
+                                       errors="replace").splitlines()
+        except OSError as exc:
+            widget.write(f"[red]Could not read log: {exc}[/red]")
+            return
+
+        for line in lines[-500:]:
+            if re.search(r"\b(ERROR|CRITICAL)\b", line):
+                widget.write(f"[bold red]{line}[/bold red]")
+            elif re.search(r"\bWARNING\b", line):
+                widget.write(f"[yellow]{line}[/yellow]")
+            elif re.search(r"\bDEBUG\b", line):
+                widget.write(f"[dim]{line}[/dim]")
+            else:
+                widget.write(line)
+
+    @on(Button.Pressed, "#log-refresh-btn")
+    def refresh_log(self) -> None:
+        self._load_log()
+
+    @on(Button.Pressed, "#log-clear-btn")
+    def clear_view(self) -> None:
+        self.query_one("#log-viewer", RichLog).clear()
+
+
+# ---------------------------------------------------------------------------
+# Grafana pane  (Tab 7)
+# ---------------------------------------------------------------------------
+
+class GrafanaPane(Container):
+    DEFAULT_CSS = """
+    GrafanaPane { height: 100%; }
+    GrafanaPane .controls {
+        height: auto;
+        border: round $primary;
+        padding: 1 2;
+        margin-bottom: 1;
+    }
+    GrafanaPane .controls Horizontal {
+        height: auto;
+        align: left middle;
+    }
+    GrafanaPane DataTable {
+        height: 1fr;
+        border: round $primary;
+    }
+    GrafanaPane .section-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    GrafanaPane .status-label {
+        height: auto;
+        color: $text-muted;
+        text-style: italic;
+        margin-left: 2;
+    }
+    GrafanaPane Button { margin-right: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="controls"):
+            yield Label("📈  Grafana Panel Monitor", classes="section-title")
+            with Horizontal():
+                yield Button("🔄  Refresh", id="grafana-refresh-btn",
+                             variant="primary")
+                yield Static("", id="grafana-last-refresh",
+                             classes="status-label")
+            yield Static("", id="grafana-status", classes="status-label")
+        yield DataTable(id="grafana-table", zebra_stripes=True)
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#grafana-table", DataTable)
+        tbl.add_columns("Series", "Latest Value", "Thresholds")
+        tbl.cursor_type = "row"
+        if APP_CONFIG.get("grafana_enabled"):
+            self._fetch_data()
+        else:
+            self.query_one("#grafana-status", Static).update(
+                "[dim]Grafana not enabled. Go to Admin → '📈 Grafana' "
+                "section to configure and enable it.[/dim]"
+            )
+        self.set_interval(60, self._auto_refresh)
+
+    def _auto_refresh(self) -> None:
+        if APP_CONFIG.get("grafana_enabled"):
+            self._fetch_data()
+
+    @on(Button.Pressed, "#grafana-refresh-btn")
+    def manual_refresh(self) -> None:
+        self._fetch_data()
+
+    @work(exclusive=True)
+    async def _fetch_data(self) -> None:
+        status = self.query_one("#grafana-status", Static)
+        last_ref = self.query_one("#grafana-last-refresh", Static)
+        status.update("[dim]⏳  Fetching from Grafana…[/dim]")
+
+        try:
+            series = await asyncio.to_thread(_grafana_query)
+        except Exception as exc:
+            logger.warning("Grafana query failed: %s", exc)
+            status.update(f"[bold red]Error: {exc}[/bold red]")
+            return
+
+        # Parse threshold rules
+        try:
+            thresholds: list = json.loads(
+                APP_CONFIG.get("grafana_thresholds", "[]") or "[]"
+            )
+        except (json.JSONDecodeError, TypeError):
+            thresholds = []
+
+        tbl = self.query_one("#grafana-table", DataTable)
+        tbl.clear()
+
+        for s in series:
+            vals = [v for v in s["values"] if v is not None]
+            if not vals:
+                tbl.add_row(s["name"], "(no data)", "—")
+                continue
+
+            latest = vals[-1]
+            parts: list[str] = []
+            for rule in thresholds:
+                if len(rule) == 3:
+                    label, op, threshold_val = rule
+                    try:
+                        hit = _grafana_check(latest, op, float(threshold_val))
+                    except (TypeError, ValueError):
+                        continue
+                    color = "red" if hit else "green"
+                    tag   = "BREACH" if hit else "ok"
+                    parts.append(
+                        f"[{color}]{tag}[/{color}] "
+                        f"[dim]{label}({latest:.2f}{op}{threshold_val})[/dim]"
+                    )
+
+            tbl.add_row(
+                s["name"],
+                f"{latest:.4f}",
+                "  ".join(parts) if parts else "(none configured)",
+            )
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        last_ref.update(f"[dim]Last refreshed: {ts}[/dim]")
+        status.update(f"[green]✅  {len(series)} series loaded[/green]")
+
 
 # ---------------------------------------------------------------------------
 # Main application
@@ -1584,7 +2266,9 @@ class SysMonitorApp(App):
         Binding("2", "switch_tab('tab-script')", "Script Runner"),
         Binding("3", "switch_tab('tab-history')", "History"),
         Binding("4", "switch_tab('tab-http')", "HTTP Tester"),
-        Binding("5", "switch_tab('tab-admin')", "Admin"),
+        Binding("5", "switch_tab('tab-admin')",   "Admin"),
+        Binding("6", "switch_tab('tab-log')",     "Log Viewer"),
+        Binding("7", "switch_tab('tab-grafana')", "Grafana"),
         Binding("r", "run_script", "Run Checks"),
     ]
 
@@ -1601,10 +2285,15 @@ class SysMonitorApp(App):
                 yield HttpTesterPane(id="http-pane")
             with TabPane("🔧  Admin", id="tab-admin"):
                 yield AdminPane(id="admin-pane")
+            with TabPane("📄  Log Viewer", id="tab-log"):
+                yield LogViewerPane(id="log-pane")
+            with TabPane("📈  Grafana", id="tab-grafana"):
+                yield GrafanaPane(id="grafana-pane")
         yield Footer()
 
     def on_mount(self) -> None:
         self.refresh_all_panes()
+        self.set_interval(60, self._auto_run_check)
 
     def refresh_all_panes(self) -> None:
         try:
@@ -1622,6 +2311,50 @@ class SysMonitorApp(App):
             self.query_one("#http-pane", HttpTesterPane).reload_examples()
         except Exception as exc:
             logger.debug("HTTP examples reload error: %s", exc)
+
+    def _auto_run_check(self) -> None:
+        """Called every 60 seconds. Triggers a script run if schedule conditions are met."""
+        if not APP_CONFIG.get("schedule_enabled"):
+            return
+
+        history  = load_history()
+        stype    = APP_CONFIG.get("schedule_type", "1h")
+        now      = datetime.now()
+        now_ts   = now.timestamp()
+
+        if stype == "daily":
+            raw_time = APP_CONFIG.get("schedule_daily_time", "09:00")
+            try:
+                hh, mm = (int(x) for x in raw_time.split(":"))
+            except (ValueError, AttributeError):
+                logger.warning("Invalid schedule_daily_time '%s'", raw_time)
+                return
+            if now.hour != hh or now.minute != mm:
+                return
+            if history:
+                last_ts = datetime.fromisoformat(history[0]["timestamp"])
+                if last_ts.date() == now.date():
+                    return  # already ran today
+        else:
+            interval_map = {
+                "15m": 15 * 60,
+                "30m": 30 * 60,
+                "1h":  60 * 60,
+                "2h":  2  * 60 * 60,
+                "6h":  6  * 60 * 60,
+                "12h": 12 * 60 * 60,
+            }
+            secs = interval_map.get(stype, 3600)
+            if history:
+                last_ts = datetime.fromisoformat(history[0]["timestamp"])
+                if (now_ts - last_ts.timestamp()) < secs:
+                    return  # not enough time has elapsed
+
+        logger.info("Auto-run triggered (schedule_type=%s).", stype)
+        try:
+            self.query_one("#script-pane", ScriptPane).run_now()
+        except Exception as exc:
+            logger.warning("Auto-run failed to start: %s", exc)
 
     def action_switch_tab(self, tab_id: str) -> None:
         self.query_one("#tabs", TabbedContent).active = tab_id
